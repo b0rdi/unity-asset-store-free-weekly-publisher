@@ -1,18 +1,14 @@
 import os
-import re
 import sys
 import json
 import logging
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, time, timezone
-from emailoctopus_sdk import Client
 from zoneinfo import ZoneInfo
 
-
-# EmailOctopus Configuration - Get from GitHub Secrets
-API_KEY = os.getenv("API_KEY")
-LIST_ID = os.getenv("LIST_ID")
+# Discord Configuration - Get from GitHub Secrets
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 # Unity Asset Store Configuration and Selectors
 ASSET_STORE_URL = "https://assetstore.unity.com"
@@ -87,45 +83,48 @@ def get_expiry_date() -> str:
 	# Convert to UTC
 	next_thursday_utc = next_thursday_8am_pt.astimezone(timezone.utc)
 	# Format it like: October 2, 2025 at 3:00PM UTC
-	return next_thursday_utc.strftime("%B %-d, %Y at %-I:%M%p UTC")
+	day = next_thursday_utc.day
+	hour = next_thursday_utc.strftime("%I:%M%p").lstrip("0")
+	return next_thursday_utc.strftime(f"%B {day}, %Y at {hour} UTC")
 
 
 # endregion: Unity Asset Store
 
-# region: Email Octopus
+# region: Discord
 
 
-def update_all_contacts_fields(asset: str, image: str, description: str, url: str) -> int:
-	"""Updates all subscribers' asset-related fields, triggering the automation to send the email."""
-	client = Client(api_key=API_KEY)
-	contacts = client.get_all_contacts(list_id=LIST_ID)
+def send_discord_notification(asset: str, image: str, description: str, url: str, price: float) -> None:
+	"""Sends a Discord webhook message about the newly detected free asset."""
+	if not url.startswith("https://"):
+		url = ASSET_STORE_URL + url
+
 	expiry_date = get_expiry_date()
-	fields = {
-		"AssetName": asset,
-		"AssetImage": image,
-		"AssetDescription": description,
-		"AssetURL": url,
-		"AssetExpiry": expiry_date
+	price_text = f"${price:.2f}" if price > 0 else "N/A"
+	payload = {
+		"embeds": [
+			{
+				"title": asset,
+				"description": description,
+				"url": url,
+				"color": 5763719,
+				"thumbnail": {"url": image} if image else None,
+				"fields": [
+					{"name": "Price", "value": price_text, "inline": True},
+					{"name": "Free Until", "value": expiry_date, "inline": True},
+				]
+			}
+		]
 	}
 
-	success_count = 0
-	failed_count = 0
-	for batch in client.update_contacts_in_batches(list_id=LIST_ID, contacts=contacts, fields=fields):
-		success_count += len(batch['success'])
-		failed_count += len(batch['errors'])
+	# Remove optional keys that are None to keep payload clean.
+	payload["embeds"][0] = {k: v for k, v in payload["embeds"][0].items() if v is not None}
 
-	for field in fields:
-		# Format the label with spaces between words
-		label = re.sub(r'([a-z])([A-Z])', r'\1 \2', field)
-		log.info(f"Updating {label}'s fallback value to: {fields[field]}")
-		client.update_list_field(list_id=LIST_ID, tag=field, label=label, fallback=fields[field])
-	
-	log.info(f"Success: {success_count}, Failed: {failed_count}")
-
-	return success_count
+	response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
+	response.raise_for_status()
+	log.info("Discord notification sent successfully.")
 
 
-# endregion: Email Octopus
+# endregion: Discord
 
 # region: Price Scraping
 
@@ -158,7 +157,7 @@ def scrape_asset_price(asset_url: str) -> float:
 		return 0.0
 
 
-def read_total_savings() -> tuple[float, int, float, int]:
+def read_total_savings() -> tuple[float, int, float, int, str | None]:
 	"""Reads the total savings, number of assets, and cumulative savings from the JSON file."""
 	try:
 		with open(SAVINGS_FILE, 'r') as f:
@@ -167,16 +166,17 @@ def read_total_savings() -> tuple[float, int, float, int]:
 			current_assets = int(data.get("total_assets", 0))
 			current_cumulative_savings = float(data.get("total_cumulative_savings", 0.0))
 			current_emails_sent = int(data.get("total_emails_sent", 0))
-			return current_savings, current_assets, current_cumulative_savings, current_emails_sent
+			last_asset_url = data.get("last_asset_url")
+			return current_savings, current_assets, current_cumulative_savings, current_emails_sent, last_asset_url
 	except FileNotFoundError:
 		log.warning(f"'{SAVINGS_FILE}' not found. Starting savings from 0.")
-		return 0.0, 0, 0.0, 0
+		return 0.0, 0, 0.0, 0, None
 	except (json.JSONDecodeError, TypeError):
 		log.error(f"Could not read or parse '{SAVINGS_FILE}'. Treating savings as 0.")
-		return 0.0, 0, 0.0, 0
+		return 0.0, 0, 0.0, 0, None
 
 
-def save_total_savings(new_total: float, new_assets: int, new_cumulative_savings: float, new_emails_sent: int) -> None:
+def save_total_savings(new_total: float, new_assets: int, new_cumulative_savings: float, new_emails_sent: int, last_asset_url: str | None = None) -> None:
 	"""Saves the new total savings, number of assets, cumulative savings, and number of emails sent to the JSON file."""
 	data = {
 		"total_savings": round(new_total, 2),
@@ -184,10 +184,11 @@ def save_total_savings(new_total: float, new_assets: int, new_cumulative_savings
 		"total_cumulative_savings": round(new_cumulative_savings, 2),
 		"total_emails_sent": new_emails_sent,
 		"last_run_date": datetime.now(tz=ZoneInfo("America/Los_Angeles")).date().isoformat(),
+		"last_asset_url": last_asset_url,
 	}
 	with open(SAVINGS_FILE, 'w') as f:
 		json.dump(data, f, indent=2)
-	log.info(f"Successfully saved new total savings: {data['total_savings']:.2f}, number of assets: {data['total_assets']}, cumulative savings: {data['total_cumulative_savings']:.2f}, emails sent: {data['total_emails_sent']}, last run date: {data['last_run_date']}")
+	log.info(f"Successfully saved new total savings: {data['total_savings']:.2f}, number of assets: {data['total_assets']}, cumulative savings: {data['total_cumulative_savings']:.2f}, emails sent: {data['total_emails_sent']}, last run date: {data['last_run_date']}, last asset URL: {data['last_asset_url']}")
 
 
 # endregion: Price Scraping
@@ -253,10 +254,8 @@ def main():
 	log.info("Starting the Unity Asset Notifier script...")
 	
 	missing_vars = []
-	if not API_KEY:
-		missing_vars.append("API_KEY")
-	if not LIST_ID:
-		missing_vars.append("LIST_ID")
+	if not DISCORD_WEBHOOK_URL:
+		missing_vars.append("DISCORD_WEBHOOK_URL")
 	
 	if missing_vars:
 		log.error(f"Error: Missing required environment variables: {', '.join(missing_vars)}")
@@ -270,18 +269,24 @@ def main():
 	log.info(f"Found asset: {asset}")
 	
 	try:
-		successful_subscribers = update_all_contacts_fields(asset, image, description, url)
+		current_savings, current_assets, current_cumulative_savings, current_emails_sent, last_asset_url = read_total_savings()
+		normalized_url = url if url.startswith("https://") else ASSET_STORE_URL + url
+		if last_asset_url == normalized_url:
+			log.info("Asset has not changed since the last successful notification. Skipping Discord send.")
+			sys.exit(0)
 
 		asset_price = scrape_asset_price(url)
+		send_discord_notification(asset, image, description, url, asset_price)
+
 		if asset_price > 0.0:
-			current_savings, current_assets, current_cumulative_savings, current_emails_sent = read_total_savings()
 			new_savings = current_savings + asset_price
 			new_assets = current_assets + 1
-			new_cumulative_savings = current_cumulative_savings + (asset_price * successful_subscribers)
-			new_emails_sent = current_emails_sent + successful_subscribers
-			save_total_savings(new_savings, new_assets, new_cumulative_savings, new_emails_sent)
+			new_cumulative_savings = current_cumulative_savings + asset_price
+			new_emails_sent = current_emails_sent + 1
+			save_total_savings(new_savings, new_assets, new_cumulative_savings, new_emails_sent, normalized_url)
 		else:
 			log.warning("Asset price is 0 or could not be found. Savings will not be updated.")
+			save_total_savings(current_savings, current_assets, current_cumulative_savings, current_emails_sent, normalized_url)
 		
 		sys.exit(0)
 	except Exception as e:

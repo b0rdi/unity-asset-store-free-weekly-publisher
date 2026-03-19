@@ -1,0 +1,38 @@
+name: Unity Free Asset Notifier
+
+on:
+  schedule:
+    # Every Thursday at 3:30 PM UTC (8:30 AM PT)
+    - cron: "30 15 * * 4"
+    # Every Thursday at 4:30 PM UTC (8:30 AM PT during DST)
+    - cron: "30 16 * * 4"
+  workflow_dispatch:
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Run notifier
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RUN_CONTEXT: ${{ github.event_name }}
+        run: python main.py
+
+      - name: Commit updated savings
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add savings.json
+          git diff --cached --quiet || git commit -m "Update savings.json" && git push
